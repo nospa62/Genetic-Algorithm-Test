@@ -1,0 +1,427 @@
+import json
+import time
+import warnings
+import random
+from geneticalgorithm import geneticalgorithm as ga
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+random.seed(42)
+
+# ----------------------------------------------------------------------------
+# Global Data Containers
+# ----------------------------------------------------------------------------
+solution_history: list = []
+final_population_fitness: list = []
+best_fitness_history = []
+avg_fitness_history = []
+worst_fitness_history = []
+
+
+# ----------------------------------------------------------------------------
+# 1. GA Callback Function
+# ----------------------------------------------------------------------------
+def on_gen(ga_instance):
+    """Callback invoked each generation to record best solution and fitness history."""
+    solution_history.append(ga_instance.best_variable)
+    best_fitness_history.append(ga_instance.best_function)
+    current_pop_fitness = ga_instance.last_generation_fitness
+    avg_fitness_history.append(np.mean(current_pop_fitness))
+    worst_fitness_history.append(np.max(current_pop_fitness))
+
+    if ga_instance.current_generation == ga_instance.max_num_iteration - 1:
+        global final_population_fitness
+        final_population_fitness = current_pop_fitness
+
+
+# ----------------------------------------------------------------------------
+# 2. Network Creation from User Data
+# ----------------------------------------------------------------------------
+def create_network_from_user_data():
+    """Defines network buses, loads, shunts, generators, lines, and transformers."""
+    print("Constructing network with slack bus at Bus 9...")
+    base_mva = 1.0
+
+    bus_data_raw = [
+        (0, 220.0, (4.0, 8.0)), (1, 220.0, (8.0, 8.0)), (2, 220.0, (20.0, 8.0)),
+        (3, 220.0, (16.0, 8.0)), (4, 220.0, (12.0, 8.0)), (5, 220.0, (8.0, 6.0)),
+        (6, 220.0, (12.0, 4.5)), (7, 380.0, (4.0, 1.0)), (8, 380.0, (20.0, 1.0)),
+        (9, 22.0, (0.0, 8.0)), (10, 22.0, (8.0, 12.0)), (11, 22.0, (24.0, 8.0)),
+        (12, 22.0, (16.0, 4.5)), (13, 22.0, (12.0, 12.0))
+    ]
+    load_data = [(1, 285, 200), (2, 325, 244), (3, 326, 244), (4, 103, 62), (5, 435, 296)]
+    shunt_data = [(3, -160), (5, -180)]
+    original_gen_data = [(10, 500, 1.03), (11, 200, 1.03), (12, 300, 1.03)]
+    line_data = [
+        (0, 1, 100, 0.0653, 0.398, 1.14), (0, 5, 300, 0.0653, 0.398, 1.14),
+        (1, 4, 300, 0.0653, 0.398, 1.14), (2, 3, 100, 0.0653, 0.398, 1.14),
+        (3, 4, 300, 0.0653, 0.398, 1.14), (3, 5, 300, 0.0653, 0.398, 1.14),
+        (7, 8, 600, 0.0328, 0.312, 1.32), (5, 6, 0.1, 0.0653, 0.398, 1.14)
+    ]
+    trafo_data = [
+        (7, 0, 1000, 13, 0), (8, 2, 1000, 13, 0), (0, 9, 1000, 13, 0),
+        (1, 10, 1000, 13, 0), (2, 11, 1000, 13, 0), (6, 12, 1000, 13, 0),
+        (4, 13, 1000, 12, 0)
+    ]
+
+    buses, bus_geodata = {}, {}
+    for bus_id, vn_kv, coords in bus_data_raw:
+        buses[bus_id] = {'p_load': 0.0, 'q_load': 0.0, 'p_gen': 0.0, 'q_gen': 0.0, 'v_mag': 1.0, 'v_ang': 0.0,
+                         'base_kv': vn_kv, 'type': 3}
+        bus_geodata[bus_id] = coords
+
+    for bus_id, p, q in load_data:
+        buses[bus_id]['p_load'] += p / base_mva
+        buses[bus_id]['q_load'] += q / base_mva
+    for bus_id, q in shunt_data:
+        buses[bus_id]['q_load'] += q / base_mva
+
+    generators = {}
+    print("Warning: Adding a slack generator at Bus 9.")
+    generators[9] = {'p_max': 2000, 'p_min': -2000, 'v_set': 1.0, 'q_min': -1000, 'q_max': 1000, 'is_slack': True,
+                     'cost_a': 0.008, 'cost_b': 7, 'cost_c': 200, 'cost_d': 0.01, 'cost_e': 1.0}
+    buses[9].update({'type': 1, 'v_mag': 1.0})
+
+    for bus_id, p_max, v_set in original_gen_data:
+        generators[bus_id] = {'p_max': p_max, 'p_min': 0.0, 'v_set': v_set, 'q_min': -0.5 * p_max, 'q_max': 0.5 * p_max,
+                              'is_slack': False, 'cost_a': 0.012, 'cost_b': 10, 'cost_c': 100, 'cost_d': 0.015,
+                              'cost_e': 1.5}
+        buses[bus_id].update({'type': 2, 'v_mag': v_set})
+
+    print("Adding a new synchronous condenser at Bus 13.")
+    generators[13] = {'p_max': 0.0, 'p_min': 0.0, 'v_set': 1.0, 'q_min': -200, 'q_max': 300, 'is_slack': False,
+                      'cost_a': 0.0, 'cost_b': 0.0, 'cost_c': 50, 'cost_d': 0.005, 'cost_e': 0.8}
+    buses[13].update({'type': 2, 'v_mag': 1.0})
+
+    branches = []
+    for f, t, length, r_km, x_km, i_ka in line_data:
+        z_base = buses[f]['base_kv'] ** 2 / base_mva
+        r, x = r_km * length / z_base, x_km * length / z_base
+        rating = np.sqrt(3) * buses[f]['base_kv'] * i_ka / base_mva
+        branches.append({'from': f, 'to': t, 'r': r, 'x': x, 'rating': rating, 'type': 'Line'})
+    for h, l, s, vk, vkr in trafo_data:
+        z_pu, r_pu = (vk / 100) * (base_mva / s), (vkr / 100) * (base_mva / s)
+        x_pu = np.sqrt(max(z_pu ** 2 - r_pu ** 2, 0.0))
+        branches.append({'from': h, 'to': l, 'r': r_pu, 'x': x_pu, 'rating': s / base_mva, 'type': 'Trafo'})
+
+    return buses, branches, generators, base_mva, bus_geodata
+
+
+# ----------------------------------------------------------------------------
+# 3. Y-Bus Matrix Construction & Power Flow Solver
+# ----------------------------------------------------------------------------
+def build_ybus(num_buses: int, branches: list) -> np.ndarray:
+    ybus = np.zeros((num_buses, num_buses), dtype=complex)
+    for br in branches:
+        i, j, y = br['from'], br['to'], 1.0 / (br['r'] + 1j * br['x'])
+        ybus[i, j] -= y;
+        ybus[j, i] -= y;
+        ybus[i, i] += y;
+        ybus[j, j] += y
+    return ybus
+
+
+def solve_power_flow(buses: dict, ybus: np.ndarray, max_iter: int = 30, tol: float = 1e-6):
+    local_buses = {bus_id: b.copy() for bus_id, b in buses.items()}
+    bus_ids = sorted(local_buses.keys())
+    idx_map = {bus: idx for idx, bus in enumerate(bus_ids)}
+    pq_idx = [idx_map[b] for b in bus_ids if local_buses[b]['type'] == 3]
+    pv_idx = [idx_map[b] for b in bus_ids if local_buses[b]['type'] == 2]
+    non_slack_idx = sorted(pv_idx + pq_idx)
+    v_mag = np.array([local_buses[b]['v_mag'] for b in bus_ids])
+    v_ang = np.array([local_buses[b]['v_ang'] for b in bus_ids])
+    converged = False
+    for _ in range(max_iter):
+        p_spec = np.array([local_buses[b]['p_gen'] - local_buses[b]['p_load'] for b in bus_ids])
+        q_spec = np.array([local_buses[b]['q_gen'] - local_buses[b]['q_load'] for b in bus_ids])
+        v = v_mag * np.exp(1j * v_ang)
+        s_calc = v * np.conj(ybus @ v)
+        p_calc, q_calc = s_calc.real, s_calc.imag
+        mismatch = np.concatenate((p_spec[non_slack_idx] - p_calc[non_slack_idx], q_spec[pq_idx] - q_calc[pq_idx]))
+        if np.max(np.abs(mismatch)) < tol:
+            converged = True
+            break
+        J11, J12, J21, J22 = (
+        np.zeros((len(non_slack_idx), len(non_slack_idx))), np.zeros((len(non_slack_idx), len(pq_idx))),
+        np.zeros((len(pq_idx), len(non_slack_idx))), np.zeros((len(pq_idx), len(pq_idx))))
+        for i_idx, i in enumerate(non_slack_idx):
+            for j_idx, j in enumerate(non_slack_idx):
+                if i != j:
+                    J11[i_idx, j_idx] = v_mag[i] * v_mag[j] * (
+                                ybus[i, j].real * np.sin(v_ang[i] - v_ang[j]) - ybus[i, j].imag * np.cos(
+                            v_ang[i] - v_ang[j]))
+                else:
+                    J11[i_idx, j_idx] = -q_calc[i] - v_mag[i] ** 2 * ybus[i, i].imag
+            for j_idx, j in enumerate(pq_idx):
+                if i != j:
+                    J12[i_idx, j_idx] = v_mag[i] * (
+                                ybus[i, j].real * np.cos(v_ang[i] - v_ang[j]) + ybus[i, j].imag * np.sin(
+                            v_ang[i] - v_ang[j]))
+                else:
+                    J12[i_idx, j_idx] = p_calc[i] / v_mag[i] + v_mag[i] * ybus[i, i].real
+        for i_idx, i in enumerate(pq_idx):
+            for j_idx, j in enumerate(non_slack_idx):
+                if i != j:
+                    J21[i_idx, j_idx] = -v_mag[i] * v_mag[j] * (
+                                ybus[i, j].real * np.cos(v_ang[i] - v_ang[j]) + ybus[i, j].imag * np.sin(
+                            v_ang[i] - v_ang[j]))
+                else:
+                    J21[i_idx, j_idx] = p_calc[i] - v_mag[i] ** 2 * ybus[i, i].real
+            for j_idx, j in enumerate(pq_idx):
+                if i != j:
+                    J22[i_idx, j_idx] = v_mag[i] * (
+                                ybus[i, j].real * np.sin(v_ang[i] - v_ang[j]) - ybus[i, j].imag * np.cos(
+                            v_ang[i] - v_ang[j]))
+                else:
+                    J22[i_idx, j_idx] = q_calc[i] / v_mag[i] - v_mag[i] * ybus[i, i].imag
+        try:
+            corr = np.linalg.solve(np.block([[J11, J12], [J21, J22]]), mismatch)
+            v_ang[non_slack_idx] += corr[:len(non_slack_idx)];
+            v_mag[pq_idx] += corr[len(non_slack_idx):]
+        except np.linalg.LinAlgError:
+            return buses, False
+    if converged:
+        s_final = (v_mag * np.exp(1j * v_ang)) * np.conj(ybus @ (v_mag * np.exp(1j * v_ang)))
+        for idx, bus_id in enumerate(bus_ids):
+            buses[bus_id].update({'v_mag_final': v_mag[idx], 'v_ang_final': v_ang[idx],
+                                  'p_gen_final': s_final.real[idx] + buses[bus_id]['p_load'],
+                                  'q_gen_final': s_final.imag[idx] + buses[bus_id]['q_load']})
+    return buses, converged
+
+
+# ----------------------------------------------------------------------------
+# 5. GA Objective Function with Enhanced Penalties
+# ----------------------------------------------------------------------------
+def f(X: np.ndarray) -> float:
+    """
+    Calculates the total cost, including generation costs and penalties for
+    violating operational constraints (losses, voltage, congestion).
+    """
+    current_buses = {k: v.copy() for k, v in network_buses.items()}
+    controlled = [g for g in network_gens.values() if not g['is_slack']]
+    idx = 0
+    for gen in controlled:
+        bus_id = next(k for k, v in network_gens.items() if v is gen)
+        if gen['p_max'] > 0:
+            current_buses[bus_id]['p_gen'] = X[idx] / base_mva;
+            idx += 1
+        current_buses[bus_id]['v_mag'] = X[idx];
+        idx += 1
+    current_buses[next(k for k, v in network_gens.items() if v['is_slack'])]['v_mag'] = X[-1]
+
+    solved, ok = solve_power_flow(current_buses, ybus)
+    if not ok:
+        return 1e9  # Return a large penalty if power flow fails
+
+    # --- Calculate Costs and Penalties ---
+    generation_cost, penalty = 0.0, 0.0
+
+    # 1. Standard Generation Cost (Active and Reactive Power)
+    for bus_id, g in network_gens.items():
+        p_mw, q_mvar = solved[bus_id]['p_gen_final'] * base_mva, solved[bus_id]['q_gen_final'] * base_mva
+        generation_cost += (g['cost_a'] * p_mw ** 2 + g['cost_b'] * p_mw + g['cost_c']) + \
+                           (g['cost_d'] * q_mvar ** 2 + g['cost_e'] * q_mvar)
+        if not g['q_min'] <= q_mvar <= g['q_max']:
+            penalty += 1e7  # Generator Q limit violation
+        if g['is_slack'] and not g['p_min'] <= p_mw <= g['p_max']:
+            penalty += 1e7  # Slack generator P limit violation
+
+    # 2. Penalty for System-Wide Losses (Active and Reactive)
+    p_gen_total, q_gen_total = sum(b['p_gen_final'] for b in solved.values()), sum(b['q_gen_final'] for b in solved.values())
+    p_load_total, q_load_total = sum(b['p_load'] for b in solved.values()), sum(b['q_load'] for b in solved.values())
+    p_loss_mw, q_loss_mvar = (p_gen_total - p_load_total) * base_mva, (q_gen_total - q_load_total) * base_mva
+    penalty += (p_loss_mw * 1000) + (q_loss_mvar * 500) # Add penalties for both P and Q losses
+
+    # 3. Penalty for Voltage Violations
+    for b in solved.values():
+        v = b['v_mag_final']
+        if not 0.95 <= v <= 1.05:
+            penalty += 1e7 * (min(abs(v - 0.95), abs(v - 1.05))) ** 2
+
+    # 4. Penalty for Branch Congestion (Loading > 90%)
+    for br in network_branches:
+        limit = 0.9 * br['rating']  # Set limit to 90% of the rating
+        if limit > 0:
+            i, j = br['from'], br['to']
+            vi = solved[i]['v_mag_final'] * np.exp(1j * solved[i]['v_ang_final'])
+            vj = solved[j]['v_mag_final'] * np.exp(1j * solved[j]['v_ang_final'])
+            s_ij = vi * np.conj((vi - vj) / (br['r'] + 1j * br['x']))
+            if abs(s_ij) > limit:
+                penalty += 1e7 * (abs(s_ij) - limit) ** 2
+
+    return generation_cost + penalty
+
+
+# ----------------------------------------------------------------------------
+# 6. Reporting & Visualization
+# ----------------------------------------------------------------------------
+def plot_convergence(best, avg, worst):
+    """Plots GA convergence and highlights the best solution found."""
+    plt.figure(figsize=(12, 6))
+    plt.plot(best, label='Best Fitness', color='green', linewidth=2)
+    plt.plot(avg, label='Average Fitness', color='blue', linestyle='--')
+    plt.plot(worst, label='Worst Fitness', color='black', linestyle=':', alpha=0.5)
+
+    # Highlight the best solution
+    best_gen = np.argmin(best)
+    best_val = best[best_gen]
+    plt.axvline(x=best_gen, color='r', linestyle='--', label=f'Optimal Solution Found (Gen {best_gen})')
+    plt.plot(best_gen, best_val, 'r*', markersize=12)
+    plt.annotate(f'Best: {best_val:.2f}', (best_gen, best_val), textcoords="offset points", xytext=(0, 10), ha='center',
+                 fontsize=9, color='red')
+
+    plt.title('GA Convergence Over Generations')
+    plt.xlabel('Generation')
+    plt.ylabel('Fitness (Cost)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def generate_ga_report(model, params, t_start, t_end, final_pop, best_hist, avg_hist, worst_hist):
+    print("\n" + "="*50 + "\n GENETIC ALGORITHM PERFORMANCE REPORT\n" + "="*50)
+    print("\n[GA Parameter Summary]"); print(pd.DataFrame.from_dict(params, orient='index', columns=['Value']))
+    if not model.report: print("\n[Performance Metrics]\nGA did not run."); return
+    init_fit, final_fit, gens_run = model.report[0], model.report[-1], len(model.report)
+    improvement = init_fit - final_fit
+    metrics = {'Runtime (s)': f"{t_end-t_start:.2f}", 'Generations': gens_run, 'Init Fitness': f"{init_fit:.2f}", 'Final Fitness': f"{final_fit:.2f}", 'Total Improvement': f"{improvement:.2f}", 'Avg Imp/Gen': f"{improvement/gens_run:.2f}" if gens_run > 0 else "N/A"}
+    print("\n[Performance Metrics]"); print(pd.DataFrame.from_dict(metrics, orient='index', columns=['Value']))
+    if final_pop:
+        print("\n[Final Population Fitness]")
+        stats = {'Best': f"{np.min(final_pop):.2f}", 'Worst': f"{np.max(final_pop):.2f}", 'Mean': f"{np.mean(final_pop):.2f}", 'Std': f"{np.std(final_pop):.2f}"}
+        print(pd.DataFrame.from_dict(stats, orient='index', columns=['Value']))
+        plt.figure(figsize=(8,4)); plt.hist(final_pop, bins=20, edgecolor='black'); plt.title('Final Population Fitness Distribution'); plt.xlabel('Cost ($/hr)'); plt.ylabel('Count'); plt.grid(True); plt.show()
+    if best_hist: plot_convergence(best_hist, avg_hist, worst_hist)
+
+
+def generate_opf_report(solved, branches, gens, base_mva, best_cost):
+    print("\n" + "="*50 + "\n OPTIMAL POWER FLOW RESULTS\n" + "="*50)
+    p_gen_tot, p_load_tot = sum(b['p_gen_final'] for b in solved.values()) * base_mva, sum(b['p_load'] for b in solved.values()) * base_mva
+    q_gen_tot, q_load_tot = sum(b['q_gen_final'] for b in solved.values()) * base_mva, sum(b['q_load'] for b in solved.values()) * base_mva
+    p_loss, q_loss = p_gen_tot - p_load_tot, q_gen_tot - q_load_tot
+    print("\n[Total System Losses]"); print(pd.DataFrame({'Active Power (MW)': [f"{p_loss:.4f}"], 'Reactive Power (MVAr)': [f"{q_loss:.4f}"]}).to_string(index=False))
+    print(f"\n[Generator Dispatch & Cost Breakdown] - Min Cost: ${best_cost:.2f}/hr")
+    dispatch_data = [{'Bus': bus_id, 'P(MW)': s['p_gen_final']*base_mva, 'Q(MVAr)': s['q_gen_final']*base_mva, 'V(pu)': s['v_mag_final'], 'Cost P': g['cost_a']*(s['p_gen_final']*base_mva)**2 + g['cost_b']*s['p_gen_final']*base_mva + g['cost_c'], 'Cost Q': g['cost_d']*(s['q_gen_final']*base_mva)**2 + g['cost_e']*s['q_gen_final']*base_mva, 'Total': (g['cost_a']*(s['p_gen_final']*base_mva)**2 + g['cost_b']*s['p_gen_final']*base_mva + g['cost_c']) + (g['cost_d']*(s['q_gen_final']*base_mva)**2 + g['cost_e']*s['q_gen_final']*base_mva)} for bus_id, g in sorted(gens.items()) for s in [solved[bus_id]]]
+    print(pd.DataFrame(dispatch_data).round(2).to_string(index=False))
+    bus_tbl = [{'Bus':k, 'V(pu)':b['v_mag_final'], 'Angle(deg)':np.degrees(b['v_ang_final']), 'P gen':b['p_gen_final']*base_mva, 'Q gen':b['q_gen_final']*base_mva, 'P load':b['p_load']*base_mva, 'Q load':b['q_load']*base_mva} for k,b in sorted(solved.items())]
+    print("\n[Comprehensive Bus Summary]"); print(pd.DataFrame(bus_tbl).round(3).to_string(index=False))
+    flow_tbl = []
+    for br in branches:
+        i, j, y = br['from'], br['to'], 1/(br['r']+1j*br['x'])
+        vi, vj = solved[i]['v_mag_final']*np.exp(1j*solved[i]['v_ang_final']), solved[j]['v_mag_final']*np.exp(1j*solved[j]['v_ang_final'])
+        s_ij, s_ji = vi*np.conj((vi-vj)*y), vj*np.conj((vj-vi)*y)
+        loss = (s_ij + s_ji) * base_mva
+        limit = 0.9 * br['rating'] * base_mva
+        loading_pct = (abs(s_ij) * base_mva / limit) * 100 if limit > 0 else 0
+        flow_tbl.append({'From':i,'To':j,'Type':br['type'],'Flow(MVA)':abs(s_ij)*base_mva, 'Limit(MVA)':limit, 'Loading(%)': loading_pct, 'Loss P(MW)':loss.real,'Loss Q(MVAr)':loss.imag})
+    print("\n[Branch Flow & Loss Analysis]"); print(pd.DataFrame(flow_tbl).round(2).to_string(index=False))
+
+
+def plot_voltage_profile(solved: dict):
+    ids = sorted(solved.keys());
+    volts = [solved[i]['v_mag_final'] for i in ids]
+    plt.figure(figsize=(10, 5));
+    plt.bar([str(i) for i in ids], volts, edgecolor='black');
+    plt.axhline(1.05, color='red', linestyle='--');
+    plt.axhline(0.95, color='red', linestyle='--');
+    plt.title('Final Bus Voltage Profile');
+    plt.xlabel('Bus');
+    plt.ylabel('V (pu)');
+    plt.grid(axis='y');
+    plt.show()
+
+
+def plot_network_topology(buses: dict, branches: list, generators: dict, coords: dict):
+    gen_buses, load_buses = list(generators.keys()), [i for i, b in buses.items() if
+                                                      b['p_load'] > 0 and i not in list(generators.keys())]
+    plt.figure(figsize=(10, 8))
+    for br in branches:
+        x0, y0 = coords[br['from']];
+        x1, y1 = coords[br['to']]
+        plt.plot([x0, x1], [y0, y1], color='purple' if br['type'] == 'Trafo' else 'gray', zorder=1)
+    other = [i for i in buses if i not in gen_buses + load_buses]
+    plt.scatter(*zip(*[coords[i] for i in other]), label='Bus', s=100, c='lightblue', edgecolors='black', zorder=2)
+    plt.scatter(*zip(*[coords[i] for i in load_buses]), label='Load', s=150, c='orange', marker='s', edgecolors='black',
+                zorder=2)
+    plt.scatter(*zip(*[coords[i] for i in gen_buses]), label='Gen', s=200, c='lightgreen', marker='^',
+                edgecolors='black', zorder=2)
+    for i, pos in coords.items(): plt.text(pos[0], pos[1] + 0.2, str(i), ha='center', weight='bold')
+    plt.legend();
+    plt.title('Network Topology');
+    plt.xlabel('X coord');
+    plt.ylabel('Y coord');
+    plt.grid(True);
+    plt.show()
+
+
+# ----------------------------------------------------------------------------
+# 7. Main Execution Block with Randomized Search
+# ----------------------------------------------------------------------------
+if __name__ == '__main__':
+    # --- Standard Network Setup ---
+    network_buses, network_branches, network_gens, base_mva, bus_geodata = create_network_from_user_data()
+    num_buses = max(network_buses.keys()) + 1
+    ybus = build_ybus(num_buses, network_branches)
+    print("✅ Network model created from user data.")
+
+    varbound = []
+    non_slack = [g for g in network_gens.values() if not g['is_slack']]
+    for g in non_slack:
+        if g['p_max'] > 0: varbound.append([g['p_min'], g['p_max']])
+        varbound.append([0.95, 1.05])
+    varbound.append([0.95, 1.05]);
+    varbound = np.array(varbound)
+
+    # --- Define Fixed GA Parameters ---
+    ga_params = {
+        'max_num_iteration': 200,
+        'population_size': 100,
+        'mutation_probability': 0.1,
+        'elit_ratio': 0.02,
+        'crossover_probability': 0.7,
+        'parents_portion': 0.3,
+        'crossover_type': 'uniform',
+        'max_iteration_without_improv': 30
+    }
+
+    # --- Create and Run the GA Model Once ---
+    print("\n\n🧬 Running GA with Fixed Parameters...")
+
+    model = ga(
+        function=f, dimension=len(varbound), variable_type='real',
+        variable_boundaries=varbound,
+        algorithm_parameters=ga_params
+    )
+
+    start_time = time.time()
+    model.run()
+    end_time = time.time()
+
+    # --- Generate Final Reports and Plots ---
+    generate_ga_report(model, ga_params, start_time, end_time, final_population_fitness, best_fitness_history,
+                       avg_fitness_history, worst_fitness_history)
+
+    final_buses = {k: v.copy() for k, v in network_buses.items()}
+    idx = 0
+    for g in non_slack:
+        bus_id = next(k for k, v in network_gens.items() if v is g)
+        if g['p_max'] > 0: final_buses[bus_id]['p_gen'] = model.best_variable[idx] / base_mva; idx += 1
+        final_buses[bus_id]['v_mag'] = model.best_variable[idx];
+        idx += 1
+    final_buses[next(k for k, v in network_gens.items() if v['is_slack'])]['v_mag'] = model.best_variable[-1]
+
+    print("\n⚡ Running final power flow with optimal solution...")
+    final_solved, converged = solve_power_flow(final_buses, ybus)
+    if converged:
+        print("✅ Final power flow converged successfully!")
+        generate_opf_report(final_solved, network_branches, network_gens, base_mva, model.best_function)
+        plot_voltage_profile(final_solved)
+        plot_network_topology(network_buses, network_branches, network_gens, bus_geodata)
+    else:
+        print("\n⚠️ Power flow did not converge with the GA's final solution.")
