@@ -556,8 +556,7 @@ if __name__ == '__main__':
         dimension= len(varbound),
         variable_type='real',
         variable_boundaries=varbound,
-        algorithm_parameters=ga_params,
-        on_generation= on_gen
+        algorithm_parameters=ga_params
     )
 
     # Run GA
